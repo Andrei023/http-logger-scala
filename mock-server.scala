@@ -27,7 +27,7 @@ case class SigninRequest(
   country: Option[String],
   dob: Option[String],
   ip: Option[String],
-  attributes: Option[Map[String, String]], 
+  attributes: Option[Map[String, String]],
   kycentityid: Option[String],
   sessionId: Option[String],
   identityProvider: Option[String],
@@ -76,11 +76,16 @@ object MockBankIdServer extends IOApp.Simple {
   }
 
   // The main entry point to build and run the server.
-  def run: IO[Unit] =
+  def run: IO[Unit] = {
+
+    // 👇 Added: read port from environment (default to 8080 for local runs)
+    val portNum = sys.env.get("PORT").flatMap(_.toIntOption).getOrElse(8080)
+    val maybePort = Port.fromInt(portNum).getOrElse(port"8080")
+
     EmberServerBuilder
       .default[IO]
       .withHost(ipv4"0.0.0.0")
-      .withPort(port"8080")
+      .withPort(maybePort)
       .withHttpApp(bankIdRoutes.orNotFound)
       .build
       .use { server =>
@@ -88,4 +93,5 @@ object MockBankIdServer extends IOApp.Simple {
         IO.never
       }
       .as(ExitCode.Success)
+  }
 }
