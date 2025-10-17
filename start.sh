@@ -1,2 +1,2 @@
 #!/bin/sh
-scala-cli run mock-server.scala
+java -jar mock-server.jar
