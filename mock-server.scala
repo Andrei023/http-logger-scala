@@ -6,6 +6,7 @@
 
 import cats.effect.*
 import com.comcast.ip4s.*
+import io.circe.*
 import io.circe.generic.auto.*
 import org.http4s.*
 import org.http4s.circe.*
@@ -14,6 +15,7 @@ import org.http4s.ember.server.*
 import org.http4s.implicits.*
 import scala.util.Random
 
+// --- Domain ---
 case class SigninRequest(
   txRefId: String,
   name: String,
@@ -34,63 +36,59 @@ case class SigninRequest(
   merchantId: Option[Int],
 )
 
+case class WrappedSignin(data: SigninRequest)
+
+// --- Flexible decoder: accepts either flat or { "data": { ... } } ---
+object FlexibleDecoders {
+  implicit val signinRequestDecoderFlexible: Decoder[SigninRequest] =
+    Decoder.instance { c =>
+      // Try wrapped first: {"data": { ... }}
+      c.downField("data").as[SigninRequest].orElse {
+        // Fallback to flat object
+        c.as[SigninRequest]
+      }
+    }
+
+  // http4s EntityDecoder using the flexible Circe decoder
+  implicit val entityDecoderSignin: EntityDecoder[IO, SigninRequest] =
+    jsonOf[IO, SigninRequest](implicitly, signinRequestDecoderFlexible)
+}
+
 object MockBankIdServer extends IOApp.Simple {
+  import FlexibleDecoders.*
 
-  // This implicit provides the magic to decode a JSON body into our SigninRequest case class.
-  implicit val signinRequestDecoder: EntityDecoder[IO, SigninRequest] = jsonOf[IO, SigninRequest]
-
-  // Define the single endpoint for our mock server.
-  val bankIdRoutes: HttpRoutes[IO] = HttpRoutes.of[IO] {
-
+  val routes: HttpRoutes[IO] = HttpRoutes.of[IO] {
     case req @ POST -> Root / "signin" =>
       for {
-        // Decode the JSON body of the request into our case class.
-        // If decoding fails, http4s will automatically generate a 400 Bad Request response.
         signinRequest <- req.as[SigninRequest]
-
-        // --- Logging incoming request details ---
         _ <- IO.println("--- Received a new request! ---")
         _ <- IO.println(s"Client IP: ${req.remoteAddr.map(_.toString).getOrElse("N/A")}")
         _ <- IO.println(s"Method: ${req.method}")
         _ <- IO.println(s"URI: ${req.uri}")
         _ <- IO.println(s"Headers: \n${req.headers.headers.mkString("  ", "\n  ", "")}")
-        _ <- IO.println(s"Cookies: ${if (req.cookies.isEmpty) "None" else req.cookies.mkString(", ")}")
-        _ <- IO.println(s"Decoded Body: \n$signinRequest")
+        _ <- IO.println(s"Decoded Body (SigninRequest): \n$signinRequest")
         _ <- IO.println("-------------------------------------------------")
 
-        // --- Handle response ---
-        // Generate a random integer for the session cookie.
+        // Set a cookie like before
         cookieValue = Random.nextInt(Int.MaxValue)
-
-        // Log the cookie value so we can see it on the server side.
-        _ <- IO.println("\n***************")
-        _ <- IO.println(s"Setting response cookie 'session-cookie' with value: $cookieValue")
-        _ <- IO.println("***************\n")
-
-        // Create the cookie.
         sessionCookie = ResponseCookie(name = "session-cookie", content = cookieValue.toString)
 
-        // Create a 200 OK response and attach the cookie to it.
-        response <- Ok().map(_.addCookie(sessionCookie))
-      } yield response
+        res <- Ok().map(_.addCookie(sessionCookie))
+      } yield res
   }
 
-  // The main entry point to build and run the server.
   def run: IO[Unit] = {
-
-    // 👇 Added: read port from environment (default to 8080 for local runs)
     val portNum = sys.env.get("PORT").flatMap(_.toIntOption).getOrElse(8080)
-    val maybePort = Port.fromInt(portNum).getOrElse(port"8080")
+    val port    = Port.fromInt(portNum).getOrElse(port"8080")
 
     EmberServerBuilder
       .default[IO]
       .withHost(ipv4"0.0.0.0")
-      .withPort(maybePort)
-      .withHttpApp(bankIdRoutes.orNotFound)
+      .withPort(port)
+      .withHttpApp(routes.orNotFound)
       .build
       .use { server =>
-        IO.println(s"🚀 Server started at ${server.address}. Waiting for POST requests to /signin...") *>
-        IO.never
+        IO.println(s"🚀 Server started at ${server.address}. POST /signin") *> IO.never
       }
       .as(ExitCode.Success)
   }
