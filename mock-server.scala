@@ -6,25 +6,20 @@
 
 import cats.effect.*
 import com.comcast.ip4s.*
-import io.circe.*
 import io.circe.generic.auto.*
-import io.circe.syntax.*
-import io.circe.parser.*
 import org.http4s.*
 import org.http4s.circe.*
 import org.http4s.dsl.io.*
 import org.http4s.ember.server.*
 import org.http4s.implicits.*
-import org.http4s.server.middleware.{ Logger => Http4sLogger }
 import scala.util.Random
 
-// ---- domain (make everything optional so minimal payload decodes) ----
 case class SigninRequest(
-  txRefId: Option[String],
-  name: Option[String],
-  firstName: Option[String],
-  lastName: Option[String],
-  personid: Option[String],
+  txRefId: String,
+  name: String,
+  firstName: String,
+  lastName: String,
+  personid: String,
   gender: Option[String],
   street: Option[String],
   city: Option[String],
@@ -36,121 +31,67 @@ case class SigninRequest(
   kycentityid: Option[String],
   sessionId: Option[String],
   identityProvider: Option[String],
-  merchantId: Option[Int]
+  merchantId: Option[Int],
 )
 
-// Accept either flat or wrapped {"data": {...}}
-object FlexibleDecoders {
-  implicit val signinRequestDecoderFlexible: Decoder[SigninRequest] =
-    Decoder.instance { c =>
-      c.downField("data").as[SigninRequest].orElse(c.as[SigninRequest])
-    }
-  implicit val entityDecoderSignin: EntityDecoder[IO, SigninRequest] =
-    jsonOf[IO, SigninRequest](implicitly, signinRequestDecoderFlexible)
-}
-
 object MockBankIdServer extends IOApp.Simple {
-  import FlexibleDecoders.*
 
-  private def jsonOk(j: Json): IO[Response[IO]] =
-    Ok(j).map(_.putHeaders(Header.Raw(ci"Content-Type", "application/json")))
+  // This implicit provides the magic to decode a JSON body into our SigninRequest case class.
+  implicit val signinRequestDecoder: EntityDecoder[IO, SigninRequest] = jsonOf[IO, SigninRequest]
 
-  // ---------- routes ----------
-  val routes: HttpRoutes[IO] = HttpRoutes.of[IO] {
+  // Define the single endpoint for our mock server.
+  val bankIdRoutes: HttpRoutes[IO] = HttpRoutes.of[IO] {
 
-    // 0) health/version to confirm deployment
-    case GET -> Root / "__health"  => Ok("ok")
-    case GET -> Root / "__version" => Ok(BuildInfoTxt) // define below or hardcode a string
-
-    // 1) RAW endpoint: logs exactly what arrived; NEVER 500s
-    case req @ POST -> Root / "signin-raw" =>
-      for {
-        body <- req.as[String].attempt
-        _    <- IO.println("\n--- 📥 /signin-raw incoming ---")
-        _    <- IO.println(s"Method: ${req.method}  URI: ${req.uri}")
-        _    <- IO.println(s"Headers:\n${req.headers.headers.mkString("  ", "\n  ", "")}")
-        _    <- IO.println(s"Body parse status: ${body.isRight}")
-        _    <- IO.println(body.fold(e => s"Body ERROR: ${e.getMessage}", b => s"Body:\n$b"))
-        _    <- IO.println("--------------------------------\n")
-        cookie = ResponseCookie("session-cookie", Random.nextInt(Int.MaxValue).toString)
-        res   <- jsonOk(Json.obj("ok" -> Json.True)).map(_.addCookie(cookie))
-      } yield res
-
-    // 2) Strict-ish endpoint: decode into case class, 400 on bad JSON, 200 on success
     case req @ POST -> Root / "signin" =>
-      req.attemptAs[SigninRequest].value.flatMap {
-        case Right(in) =>
-          for {
-            _ <- IO.println("\n--- ✅ /signin decoded ---")
-            _ <- IO.println(s"Headers:\n${req.headers.headers.mkString("  ", "\n  ", "")}")
-            _ <- IO.println(s"Decoded:\n$in")
-            _ <- IO.println("--------------------------------\n")
-            cookie = ResponseCookie("session-cookie", Random.nextInt(Int.MaxValue).toString)
-            res <- jsonOk(
-              Json.obj(
-                "ok" -> Json.True,
-                "txRefId"   -> Json.fromString(in.txRefId.getOrElse("")),
-                "sessionId" -> Json.fromString(in.sessionId.getOrElse(""))
-              )
-            ).map(_.addCookie(cookie))
-          } yield res
+      for {
+        // Decode the JSON body of the request into our case class.
+        // If decoding fails, http4s will automatically generate a 400 Bad Request response.
+        signinRequest <- req.as[SigninRequest]
 
-        case Left(err) =>
-          for {
-            raw <- req.as[String].attempt.map(_.getOrElse("<failed to read body>"))
-            _   <- IO.println("\n❌ JSON decode error on /signin")
-            _   <- IO.println(err)
-            _   <- IO.println(s"Raw body:\n$raw")
-            _   <- IO.println("--------------------------------\n")
-            res <- BadRequest(
-              Json.obj(
-                "error"   -> Json.fromString("Invalid JSON"),
-                "details" -> Json.fromString(err.getMessage)
-              )
-            )
-          } yield res
-      }
+        // --- Logging incoming request details ---
+        _ <- IO.println("--- Received a new request! ---")
+        _ <- IO.println(s"Client IP: ${req.remoteAddr.map(_.toString).getOrElse("N/A")}")
+        _ <- IO.println(s"Method: ${req.method}")
+        _ <- IO.println(s"URI: ${req.uri}")
+        _ <- IO.println(s"Headers: \n${req.headers.headers.mkString("  ", "\n  ", "")}")
+        _ <- IO.println(s"Cookies: ${if (req.cookies.isEmpty) "None" else req.cookies.mkString(", ")}")
+        _ <- IO.println(s"Decoded Body: \n$signinRequest")
+        _ <- IO.println("-------------------------------------------------")
+
+        // --- Handle response ---
+        // Generate a random integer for the session cookie.
+        cookieValue = Random.nextInt(Int.MaxValue)
+
+        // Log the cookie value so we can see it on the server side.
+        _ <- IO.println("\n***************")
+        _ <- IO.println(s"Setting response cookie 'session-cookie' with value: $cookieValue")
+        _ <- IO.println("***************\n")
+
+        // Create the cookie.
+        sessionCookie = ResponseCookie(name = "session-cookie", content = cookieValue.toString)
+
+        // Create a 200 OK response and attach the cookie to it.
+        response <- Ok().map(_.addCookie(sessionCookie))
+      } yield response
   }
 
-  // ---------- app with robust error logging ----------
+  // The main entry point to build and run the server.
   def run: IO[Unit] = {
-    val port = sys.env.get("PORT").flatMap(_.toIntOption).flatMap(Port.fromInt).getOrElse(port"8080")
 
-    val baseApp: HttpApp[IO] = routes.orNotFound
-
-    // Wrap with:
-    //  - http4s built-in request/response logger (headers + bodies)
-    //  - a top-level .handleErrorWith that logs + returns JSON 500
-    val loggedApp: HttpApp[IO] =
-      Http4sLogger.httpApp(logHeaders = true, logBody = true)(
-        baseApp.handleErrorWith { ex =>
-          for {
-            _ <- IO.println("\n💥 TOP-LEVEL ERROR (unhandled):")
-            _ <- IO.println(ex)
-            _ <- IO.println("--------------------------------\n")
-            res <- InternalServerError(
-              Json.obj(
-                "error"   -> Json.fromString("Internal Server Error"),
-                "details" -> Json.fromString(Option(ex.getMessage).getOrElse(ex.toString))
-              )
-            )
-          } yield res
-        }
-      )
+    // 👇 Added: read port from environment (default to 8080 for local runs)
+    val portNum = sys.env.get("PORT").flatMap(_.toIntOption).getOrElse(8080)
+    val maybePort = Port.fromInt(portNum).getOrElse(port"8080")
 
     EmberServerBuilder
       .default[IO]
       .withHost(ipv4"0.0.0.0")
-      .withPort(port)
-      .withHttpApp(loggedApp)
+      .withPort(maybePort)
+      .withHttpApp(bankIdRoutes.orNotFound)
       .build
-      .use { srv =>
-        IO.println(s"🚀 Running at ${srv.address}  |  POST /signin  &  /signin-raw") *> IO.never
+      .use { server =>
+        IO.println(s"🚀 Server started yes at ${server.address}. Waiting for POST requests to /signin...") *>
+        IO.never
       }
       .as(ExitCode.Success)
   }
-
-  // Tiny version string; replace with your build info if you like
-  private val BuildInfoTxt =
-    s"version=debug-logging-1  time=${java.time.Instant.now}"
 }
