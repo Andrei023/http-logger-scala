@@ -8,7 +8,7 @@
 import cats.effect.*
 import com.comcast.ip4s.*
 import io.circe.*
-import io.circe.generic.semiauto.*   // use semiauto deriveDecoder
+import io.circe.generic.semiauto.*   // deriveDecoder
 import org.http4s.*
 import org.http4s.circe.*
 import org.http4s.dsl.io.*
@@ -38,18 +38,15 @@ case class SigninRequest(
   merchantId: Option[Int]
 )
 
-// ---- Accept either flat or wrapped {"data": {...}} safely (no recursion) ----
+// ---- Accept either flat or wrapped {"data": {...}} safely ----
 object FlexibleDecoders {
-  // Base decoder only knows flat SigninRequest (not implicit to avoid ambiguity)
   private val signinBaseDecoder: Decoder[SigninRequest] = deriveDecoder[SigninRequest]
 
-  // Flexible decoder: try wrapped first, then flat — both use the base decoder
   implicit val signinRequestDecoderFlexible: Decoder[SigninRequest] =
     Decoder.instance { c =>
       c.downField("data").as(signinBaseDecoder).orElse(signinBaseDecoder(c))
     }
 
-  // http4s entity decoder using the flexible Circe decoder (passed explicitly)
   implicit val entityDecoderSignin: EntityDecoder[IO, SigninRequest] =
     jsonOf[IO, SigninRequest](implicitly, signinRequestDecoderFlexible)
 }
@@ -60,11 +57,11 @@ object MockBankIdServer extends IOApp.Simple {
   // ---------- Routes ----------
   val routes: HttpRoutes[IO] = HttpRoutes.of[IO] {
 
-    // Health/version (confirm deploys)
+    // Health/version endpoints
     case GET -> Root / "__health"  => Ok("ok")
     case GET -> Root / "__version" => Ok(BuildInfoTxt)
 
-    // RAW endpoint: logs exactly what arrived; NEVER 500s
+    // RAW endpoint: logs exactly what arrived; sets cookie; never 500s
     case req @ POST -> Root / "signin-raw" =>
       for {
         body <- req.as[String].attempt
@@ -73,12 +70,19 @@ object MockBankIdServer extends IOApp.Simple {
         _    <- IO.println(s"Headers:\n${req.headers.headers.mkString("  ", "\n  ", "")}")
         _    <- IO.println(s"Body parse status: ${body.isRight}")
         _    <- IO.println(body.fold(e => s"Body ERROR: ${e.getMessage}", b => s"Body:\n$b"))
-        _    <- IO.println("--------------------------------\n")
-        cookie = ResponseCookie("session-cookie", Random.nextInt(Int.MaxValue).toString)
-        res   <- Ok(io.circe.Json.obj("ok" -> Json.True)).map(_.addCookie(cookie))
+        _    <- IO.println("--------------------------------")
+
+        // --- Set cookie (simple original logic) ---
+        cookieValue = Random.nextInt(Int.MaxValue)
+        _ <- IO.println("\n***************")
+        _ <- IO.println(s"Setting response cookie 'session-cookie' with value: $cookieValue")
+        _ <- IO.println("***************\n")
+
+        sessionCookie = ResponseCookie(name = "session-cookie", content = cookieValue.toString)
+        res <- Ok(Json.obj("ok" -> Json.True)).map(_.addCookie(sessionCookie))
       } yield res
 
-    // Decode into case class, 400 on bad JSON, 200 on success
+    // /signin endpoint: decode, log, set cookie
     case req @ POST -> Root / "signin" =>
       req.attemptAs[SigninRequest].value.flatMap {
         case Right(in) =>
@@ -86,15 +90,23 @@ object MockBankIdServer extends IOApp.Simple {
             _ <- IO.println("\n--- ✅ /signin decoded ---")
             _ <- IO.println(s"Headers:\n${req.headers.headers.mkString("  ", "\n  ", "")}")
             _ <- IO.println(s"Decoded:\n$in")
-            _ <- IO.println("--------------------------------\n")
-            cookie = ResponseCookie("session-cookie", Random.nextInt(Int.MaxValue).toString)
+            _ <- IO.println("--------------------------------")
+
+            // --- Set cookie (simple original logic) ---
+            cookieValue = Random.nextInt(Int.MaxValue)
+            _ <- IO.println("\n***************")
+            _ <- IO.println(s"Setting response cookie 'session-cookie' with value: $cookieValue")
+            _ <- IO.println("***************\n")
+
+            sessionCookie = ResponseCookie(name = "session-cookie", content = cookieValue.toString)
+
             res <- Ok(
               Json.obj(
                 "ok"        -> Json.True,
                 "txRefId"   -> Json.fromString(in.txRefId.getOrElse("")),
                 "sessionId" -> Json.fromString(in.sessionId.getOrElse(""))
               )
-            ).map(_.addCookie(cookie))
+            ).map(_.addCookie(sessionCookie))
           } yield res
 
         case Left(err) =>
@@ -120,7 +132,6 @@ object MockBankIdServer extends IOApp.Simple {
 
     val baseApp: HttpApp[IO] = routes.orNotFound
 
-    // Guarded app: catch ANY unhandled exception and return JSON 500 (with logs)
     val guarded: HttpApp[IO] = HttpApp[IO] { req =>
       baseApp(req).handleErrorWith { ex =>
         IO.println("\n💥 TOP-LEVEL ERROR (unhandled):") *>
@@ -135,7 +146,6 @@ object MockBankIdServer extends IOApp.Simple {
       }
     }
 
-    // Add request/response logging (headers + bodies)
     val loggedApp: HttpApp[IO] =
       Http4sLogger.httpApp(logHeaders = true, logBody = true)(guarded)
 
@@ -152,7 +162,7 @@ object MockBankIdServer extends IOApp.Simple {
       .as(ExitCode.Success)
   }
 
-  // Simple version string so each deploy shows a new value
+  // Simple version info
   private val BuildInfoTxt =
-    s"version=debug-logging-OK-2  time=${java.time.Instant.now}"
+    s"version=debug-logging-simple-cookie  time=${java.time.Instant.now}"
 }
