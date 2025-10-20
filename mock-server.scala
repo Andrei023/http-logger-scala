@@ -16,13 +16,14 @@ import org.http4s.ember.server.*
 import org.http4s.implicits.*
 import scala.util.Random
 
-// --- Domain ---
+// Make every field optional so a minimal JSON from Spring decodes
+// Missing fields will be decoded as None.
 case class SigninRequest(
-  txRefId: String,
-  name: String,
-  firstName: String,
-  lastName: String,
-  personid: String,
+  txRefId: Option[String],
+  name: Option[String],
+  firstName: Option[String],
+  lastName: Option[String],
+  personid: Option[String],
   gender: Option[String],
   street: Option[String],
   city: Option[String],
@@ -34,10 +35,10 @@ case class SigninRequest(
   kycentityid: Option[String],
   sessionId: Option[String],
   identityProvider: Option[String],
-  merchantId: Option[Int],
+  merchantId: Option[Int]
 )
 
-// --- Flexible decoder to support flat or wrapped "data" format ---
+// Accept either flat or wrapped {"data": {...}}
 object FlexibleDecoders {
   implicit val signinRequestDecoderFlexible: Decoder[SigninRequest] =
     Decoder.instance { c =>
@@ -51,74 +52,59 @@ object FlexibleDecoders {
 object MockBankIdServer extends IOApp.Simple {
   import FlexibleDecoders.*
 
+  private def okJson(obj: Json): IO[Response[IO]] =
+    Ok(obj).map(_.putHeaders(Header.Raw(ci"Content-Type", "application/json")))
+
   val routes: HttpRoutes[IO] = HttpRoutes.of[IO] {
-
     case req @ POST -> Root / "signin" =>
-      // attempt decode + log failures manually
-      req
-        .attemptAs[SigninRequest]
-        .value
-        .flatMap {
-          case Right(signinRequest) =>
-            for {
-              _ <- IO.println("--- ✅ Received new request ---")
-              _ <- IO.println(s"Client IP: ${req.remoteAddr.map(_.toString).getOrElse("N/A")}")
-              _ <- IO.println(s"Method: ${req.method}")
-              _ <- IO.println(s"URI: ${req.uri}")
-              _ <- IO.println(s"Headers: \n${req.headers.headers.mkString("  ", "\n  ", "")}")
-              _ <- IO.println(s"Decoded Body: $signinRequest")
-              _ <- IO.println("-------------------------------------------------\n")
-
-              cookieValue = Random.nextInt(Int.MaxValue)
-              sessionCookie = ResponseCookie(name = "session-cookie", content = cookieValue.toString)
-
-              resp <- Ok().map(_.addCookie(sessionCookie))
-            } yield resp
-
-          case Left(err) =>
-            // Circe decoding failure
-            for {
-              _ <- IO.println("❌ JSON decoding failed:")
-              _ <- IO.println(err)
-              body <- req.as[String].attempt.map {
-                case Right(raw) => raw
-                case Left(_)    => "<failed to read raw body>"
-              }
-              _ <- IO.println(s"Raw body:\n$body")
-              _ <- IO.println("-------------------------------------------------\n")
-              resp <- BadRequest(Json.obj(
-                "error" -> Json.fromString("Invalid JSON or structure"),
-                "details" -> Json.fromString(err.getMessage)
-              ))
-            } yield resp
-        }
-        .handleErrorWith { ex =>
-          // catch-all for any other runtime errors
+      // Decode with logs; never explode — return 400 on bad JSON
+      req.attemptAs[SigninRequest].value.flatMap {
+        case Right(in) =>
           for {
-            _ <- IO.println(s"💥 Internal error: ${ex.getMessage}")
-            _ <- IO.println(ex)
-            _ <- IO.println("-------------------------------------------------\n")
-            resp <- InternalServerError(Json.obj(
-              "error" -> Json.fromString("Internal Server Error"),
-              "details" -> Json.fromString(ex.toString)
-            ))
+            _ <- IO.println("--- ✅ Received /signin ---")
+            _ <- IO.println(s"Headers:\n${req.headers.headers.mkString("  ", "\n  ", "")}")
+            _ <- IO.println(s"Decoded:\n$in")
+            cookie = ResponseCookie("session-cookie", Random.nextInt(Int.MaxValue).toString)
+            resp   <- okJson(Json.obj(
+                        "ok" -> Json.True,
+                        "txRefId" -> Json.fromString(in.txRefId.getOrElse("")),
+                        "sessionId" -> Json.fromString(in.sessionId.getOrElse(""))
+                      )).map(_.addCookie(cookie))
           } yield resp
-        }
+
+        case Left(err) =>
+          for {
+            raw <- req.as[String].attempt.map(_.getOrElse("<failed to read body>"))
+            _   <- IO.println("❌ JSON decode error on /signin")
+            _   <- IO.println(err)
+            _   <- IO.println(s"Raw body:\n$raw")
+            resp <- BadRequest(Json.obj(
+                      "error" -> Json.fromString("Invalid JSON"),
+                      "details" -> Json.fromString(err.getMessage)
+                    ))
+          } yield resp
+      }.handleErrorWith { ex =>
+        for {
+          _ <- IO.println(s"💥 Internal error: ${ex.getMessage}")
+          _ <- IO.println(ex)
+          resp <- InternalServerError(Json.obj(
+                    "error" -> Json.fromString("Internal Server Error"),
+                    "details" -> Json.fromString(ex.toString)
+                  ))
+        } yield resp
+      }
   }
 
   def run: IO[Unit] = {
-    val portNum = sys.env.get("PORT").flatMap(_.toIntOption).getOrElse(8080)
-    val port    = Port.fromInt(portNum).getOrElse(port"8080")
-
+    val port = sys.env.get("PORT").flatMap(_.toIntOption).flatMap(Port.fromInt).getOrElse(port"8080")
     EmberServerBuilder
       .default[IO]
       .withHost(ipv4"0.0.0.0")
       .withPort(port)
       .withHttpApp(routes.orNotFound)
       .build
-      .use { server =>
-        IO.println(s"🚀 Server running at ${server.address}. POST /signin") *>
-        IO.never
+      .use { srv =>
+        IO.println(s"🚀 POST /signin on ${srv.address}") *> IO.never
       }
       .as(ExitCode.Success)
   }
