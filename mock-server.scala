@@ -8,6 +8,7 @@ import cats.effect.*
 import com.comcast.ip4s.*
 import io.circe.*
 import io.circe.generic.auto.*
+import io.circe.syntax.*
 import org.http4s.*
 import org.http4s.circe.*
 import org.http4s.dsl.io.*
@@ -36,20 +37,13 @@ case class SigninRequest(
   merchantId: Option[Int],
 )
 
-case class WrappedSignin(data: SigninRequest)
-
-// --- Flexible decoder: accepts either flat or { "data": { ... } } ---
+// --- Flexible decoder to support flat or wrapped "data" format ---
 object FlexibleDecoders {
   implicit val signinRequestDecoderFlexible: Decoder[SigninRequest] =
     Decoder.instance { c =>
-      // Try wrapped first: {"data": { ... }}
-      c.downField("data").as[SigninRequest].orElse {
-        // Fallback to flat object
-        c.as[SigninRequest]
-      }
+      c.downField("data").as[SigninRequest].orElse(c.as[SigninRequest])
     }
 
-  // http4s EntityDecoder using the flexible Circe decoder
   implicit val entityDecoderSignin: EntityDecoder[IO, SigninRequest] =
     jsonOf[IO, SigninRequest](implicitly, signinRequestDecoderFlexible)
 }
@@ -58,23 +52,58 @@ object MockBankIdServer extends IOApp.Simple {
   import FlexibleDecoders.*
 
   val routes: HttpRoutes[IO] = HttpRoutes.of[IO] {
+
     case req @ POST -> Root / "signin" =>
-      for {
-        signinRequest <- req.as[SigninRequest]
-        _ <- IO.println("--- Received a new request! ---")
-        _ <- IO.println(s"Client IP: ${req.remoteAddr.map(_.toString).getOrElse("N/A")}")
-        _ <- IO.println(s"Method: ${req.method}")
-        _ <- IO.println(s"URI: ${req.uri}")
-        _ <- IO.println(s"Headers: \n${req.headers.headers.mkString("  ", "\n  ", "")}")
-        _ <- IO.println(s"Decoded Body (SigninRequest): \n$signinRequest")
-        _ <- IO.println("-------------------------------------------------")
+      // attempt decode + log failures manually
+      req
+        .attemptAs[SigninRequest]
+        .value
+        .flatMap {
+          case Right(signinRequest) =>
+            for {
+              _ <- IO.println("--- ✅ Received new request ---")
+              _ <- IO.println(s"Client IP: ${req.remoteAddr.map(_.toString).getOrElse("N/A")}")
+              _ <- IO.println(s"Method: ${req.method}")
+              _ <- IO.println(s"URI: ${req.uri}")
+              _ <- IO.println(s"Headers: \n${req.headers.headers.mkString("  ", "\n  ", "")}")
+              _ <- IO.println(s"Decoded Body: $signinRequest")
+              _ <- IO.println("-------------------------------------------------\n")
 
-        // Set a cookie like before
-        cookieValue = Random.nextInt(Int.MaxValue)
-        sessionCookie = ResponseCookie(name = "session-cookie", content = cookieValue.toString)
+              cookieValue = Random.nextInt(Int.MaxValue)
+              sessionCookie = ResponseCookie(name = "session-cookie", content = cookieValue.toString)
 
-        res <- Ok().map(_.addCookie(sessionCookie))
-      } yield res
+              resp <- Ok().map(_.addCookie(sessionCookie))
+            } yield resp
+
+          case Left(err) =>
+            // Circe decoding failure
+            for {
+              _ <- IO.println("❌ JSON decoding failed:")
+              _ <- IO.println(err)
+              body <- req.as[String].attempt.map {
+                case Right(raw) => raw
+                case Left(_)    => "<failed to read raw body>"
+              }
+              _ <- IO.println(s"Raw body:\n$body")
+              _ <- IO.println("-------------------------------------------------\n")
+              resp <- BadRequest(Json.obj(
+                "error" -> Json.fromString("Invalid JSON or structure"),
+                "details" -> Json.fromString(err.getMessage)
+              ))
+            } yield resp
+        }
+        .handleErrorWith { ex =>
+          // catch-all for any other runtime errors
+          for {
+            _ <- IO.println(s"💥 Internal error: ${ex.getMessage}")
+            _ <- IO.println(ex)
+            _ <- IO.println("-------------------------------------------------\n")
+            resp <- InternalServerError(Json.obj(
+              "error" -> Json.fromString("Internal Server Error"),
+              "details" -> Json.fromString(ex.toString)
+            ))
+          } yield resp
+        }
   }
 
   def run: IO[Unit] = {
@@ -88,7 +117,8 @@ object MockBankIdServer extends IOApp.Simple {
       .withHttpApp(routes.orNotFound)
       .build
       .use { server =>
-        IO.println(s"🚀 Server started at ${server.address}. POST /signin") *> IO.never
+        IO.println(s"🚀 Server running at ${server.address}. POST /signin") *>
+        IO.never
       }
       .as(ExitCode.Success)
   }
