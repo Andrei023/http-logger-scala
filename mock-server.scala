@@ -8,8 +8,7 @@
 import cats.effect.*
 import com.comcast.ip4s.*
 import io.circe.*
-import io.circe.generic.auto.*
-import io.circe.syntax.*
+import io.circe.generic.semiauto.*   // use semiauto deriveDecoder
 import org.http4s.*
 import org.http4s.circe.*
 import org.http4s.dsl.io.*
@@ -39,16 +38,20 @@ case class SigninRequest(
   merchantId: Option[Int]
 )
 
-// ---- Accept either flat or wrapped {"data": {...}} ----
+// ---- Accept either flat or wrapped {"data": {...}} safely (no recursion) ----
 object FlexibleDecoders {
+  // Base decoder only knows flat SigninRequest (not implicit to avoid ambiguity)
+  private val signinBaseDecoder: Decoder[SigninRequest] = deriveDecoder[SigninRequest]
+
+  // Flexible decoder: try wrapped first, then flat — both use the base decoder
   implicit val signinRequestDecoderFlexible: Decoder[SigninRequest] =
     Decoder.instance { c =>
-      c.downField("data").as[SigninRequest].orElse(c.as[SigninRequest])
+      c.downField("data").as(signinBaseDecoder).orElse(signinBaseDecoder(c))
     }
 
-  // http4s entity decoder using the flexible Circe decoder above
+  // http4s entity decoder using the flexible Circe decoder (passed explicitly)
   implicit val entityDecoderSignin: EntityDecoder[IO, SigninRequest] =
-    jsonOf[IO, SigninRequest] // picks up implicit Decoder[SigninRequest]
+    jsonOf[IO, SigninRequest](implicitly, signinRequestDecoderFlexible)
 }
 
 object MockBankIdServer extends IOApp.Simple {
@@ -57,7 +60,7 @@ object MockBankIdServer extends IOApp.Simple {
   // ---------- Routes ----------
   val routes: HttpRoutes[IO] = HttpRoutes.of[IO] {
 
-    // Health/version (useful to confirm deploys)
+    // Health/version (confirm deploys)
     case GET -> Root / "__health"  => Ok("ok")
     case GET -> Root / "__version" => Ok(BuildInfoTxt)
 
@@ -72,10 +75,10 @@ object MockBankIdServer extends IOApp.Simple {
         _    <- IO.println(body.fold(e => s"Body ERROR: ${e.getMessage}", b => s"Body:\n$b"))
         _    <- IO.println("--------------------------------\n")
         cookie = ResponseCookie("session-cookie", Random.nextInt(Int.MaxValue).toString)
-        res   <- Ok(Json.obj("ok" -> Json.True)).map(_.addCookie(cookie))
+        res   <- Ok(io.circe.Json.obj("ok" -> Json.True)).map(_.addCookie(cookie))
       } yield res
 
-    // Strict-ish endpoint: decode into case class, 400 on bad JSON, 200 on success
+    // Decode into case class, 400 on bad JSON, 200 on success
     case req @ POST -> Root / "signin" =>
       req.attemptAs[SigninRequest].value.flatMap {
         case Right(in) =>
@@ -151,5 +154,5 @@ object MockBankIdServer extends IOApp.Simple {
 
   // Simple version string so each deploy shows a new value
   private val BuildInfoTxt =
-    s"version=debug-logging-OK  time=${java.time.Instant.now}"
+    s"version=debug-logging-OK-2  time=${java.time.Instant.now}"
 }
