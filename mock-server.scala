@@ -15,11 +15,11 @@ import org.http4s.implicits.*
 import scala.util.Random
 
 case class SigninRequest(
-  txRefId: String,
-  name: String,
-  firstName: String,
-  lastName: String,
-  personid: String,
+  txRefId: Option[String],
+  name: Option[String],
+  firstName: Option[String],
+  lastName: Option[String],
+  personid: Option[String],
   gender: Option[String],
   street: Option[String],
   city: Option[String],
